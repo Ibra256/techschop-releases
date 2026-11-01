@@ -1,0 +1,97 @@
+name: Publish TechShop Windows release
+
+on:
+  repository_dispatch:
+    types: [publish-techshop-windows-release]
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Download the signed CI artifact
+        env:
+          ARTIFACT_URL: ${{ github.event.client_payload.artifact_url }}
+        run: |
+          python3 - <<'PY'
+          import os
+          import urllib.request
+
+          url = os.environ['ARTIFACT_URL']
+          if not url.startswith('https://'):
+              raise SystemExit('Artifact download URL must use HTTPS.')
+          request = urllib.request.Request(url, headers={'User-Agent': 'TechShop-release-publisher'})
+          try:
+              with urllib.request.urlopen(request, timeout=90) as response, open('build-artifact.zip', 'wb') as output:
+                  while chunk := response.read(1024 * 1024):
+                      output.write(chunk)
+          except Exception:
+              raise SystemExit('Could not download the signed CI artifact.')
+          PY
+
+      - name: Verify and extract release assets
+        env:
+          VERSION: ${{ github.event.client_payload.version }}
+        run: |
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import zipfile
+
+          version = os.environ['VERSION']
+          artifact = zipfile.ZipFile('build-artifact.zip')
+          if artifact.testzip() is not None:
+              raise SystemExit('CI artifact ZIP failed its CRC check.')
+          expected = {
+              'latest.json',
+              f'TechShop_{version}_x64-setup.exe',
+              f'TechShop_{version}_x64-setup.exe.sig',
+              f'TechShop-{version}-Windows-USB.tsupdate',
+          }
+          if set(artifact.namelist()) != expected:
+              raise SystemExit('CI artifact contents do not match the expected release assets.')
+          Path('release-output').mkdir()
+          artifact.extractall('release-output')
+
+          output = Path('release-output')
+          manifest = json.loads((output / 'latest.json').read_text())
+          signature = (output / f'TechShop_{version}_x64-setup.exe.sig').read_text().strip()
+          if manifest['version'] != version:
+              raise SystemExit('Updater manifest version does not match the release.')
+          if manifest['platforms']['windows-x86_64']['signature'] != signature:
+              raise SystemExit('Updater manifest signature does not match the detached signature.')
+
+          installer = output / f'TechShop_{version}_x64-setup.exe'
+          bundle = zipfile.ZipFile(output / f'TechShop-{version}-Windows-USB.tsupdate')
+          if bundle.testzip() is not None or set(bundle.namelist()) != {'manifest.json', 'installer.exe'}:
+              raise SystemExit('USB update bundle failed validation.')
+          if json.loads(bundle.read('manifest.json')) != manifest:
+              raise SystemExit('USB bundle manifest does not match latest.json.')
+          digest = lambda stream: hashlib.file_digest(stream, 'sha256').hexdigest()
+          with installer.open('rb') as stream:
+              installer_hash = digest(stream)
+          with bundle.open('installer.exe') as stream:
+              bundled_hash = digest(stream)
+          if installer_hash != bundled_hash:
+              raise SystemExit('Standalone installer does not match the USB bundle installer.')
+          print(f'Validated TechShop {version}; installer SHA-256 {installer_hash}.')
+          PY
+
+      - name: Upload assets and publish stable release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ github.event.client_payload.version }}
+        run: |
+          tag="v${VERSION}"
+          gh release upload "$tag" release-output/* --repo "$GITHUB_REPOSITORY" --clobber
+          release_id=$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${tag}" --jq '.id')
+          gh api "repos/${GITHUB_REPOSITORY}/releases/${release_id}" \
+            --method PATCH \
+            -f draft=false \
+            -f prerelease=false \
+            -f make_latest=true
