@@ -89,7 +89,8 @@ jobs:
         run: |
           tag="v${VERSION}"
           gh release upload "$tag" release-output/* --repo "$GITHUB_REPOSITORY" --clobber
-          release_id=$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${tag}" --jq '.id')
+          release_id=$(gh api "repos/${GITHUB_REPOSITORY}/releases" | python3 -c 'import json,os,sys; releases=json.load(sys.stdin); matches=[item["id"] for item in releases if item["draft"] and item["tag_name"] == "v" + os.environ["VERSION"]]; print(matches[0] if matches else "")')
+          if [ -z "$release_id" ]; then echo 'Could not find the draft release to publish.'; exit 1; fi
           gh api "repos/${GITHUB_REPOSITORY}/releases/${release_id}" \
             --method PATCH \
             -f draft=false \
